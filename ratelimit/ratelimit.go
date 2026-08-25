@@ -105,15 +105,18 @@ func (rl Ratelimit) Limit(ctx context.Context, r *http.Request) (Limit, error) {
 		return Limit{GotIdentifier: identifier}, err
 	}
 
-	// Check if the rate has been exceeded
-	exceeded := *currentRate > rl.MaxRequests
-
 	// Increment the rate
 	err = State.HotCache.IncrementOne(ctx, rl.Bucket+"-"+identifier)
 
 	if err != nil {
 		return Limit{GotIdentifier: identifier}, err
 	}
+
+	// madeRequests counts this request too, since IncrementOne just
+	// accounted for it — checking exceeded against the pre-increment value
+	// let exactly one extra request through per bucket before blocking.
+	madeRequests := *currentRate + 1
+	exceeded := madeRequests > rl.MaxRequests
 
 	// Get the time when the rate will reset
 	resetTime, err := State.HotCache.Expiry(ctx, rl.Bucket+"-"+identifier)
@@ -125,7 +128,7 @@ func (rl Ratelimit) Limit(ctx context.Context, r *http.Request) (Limit, error) {
 	return Limit{
 		GotIdentifier: identifier,
 		Exceeded:      exceeded,
-		Made:          *currentRate,
+		Made:          madeRequests,
 		TimeToReset:   resetTime,
 		MaxRequests:   rl.MaxRequests,
 		Bucket:        rl.Bucket,
