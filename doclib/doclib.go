@@ -12,10 +12,11 @@ import (
 )
 
 type SetupData struct {
-	URL             string
-	ErrorStruct     any
-	Info            Info
-	errorStructName string
+	URL               string
+	ServerDescription string
+	ErrorStruct       any
+	Info              Info
+	errorStructName   string
 }
 
 var (
@@ -58,6 +59,7 @@ func Setup() {
 
 	api.Info = DocsSetupData.Info
 	api.Servers[0].URL = DocsSetupData.URL
+	api.Servers[0].Description = DocsSetupData.ServerDescription
 	api.Paths = orderedmap.New[string, Path]()
 	api.Webhooks = orderedmap.New[string, Path]()
 }
@@ -66,8 +68,7 @@ var api = Openapi{
 	OpenAPI: "3.1.0",
 	Servers: []Server{
 		{
-			Description: "Popplio (v6)",
-			Variables:   map[string]any{},
+			Variables: map[string]any{},
 		},
 	},
 	Components: Component{

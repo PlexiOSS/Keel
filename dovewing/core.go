@@ -316,7 +316,7 @@ func ClearUser(ctx context.Context, id string, platform Platform, req ClearUserR
 			return nil, err
 		}
 
-		clearedFrom = append(clearedFrom, ClearFromRedis) // TODO: make this a constant
+		clearedFrom = append(clearedFrom, ClearFromRedis)
 	}
 
 	return &ClearUserInfo{

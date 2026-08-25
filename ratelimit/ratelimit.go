@@ -4,11 +4,11 @@ package ratelimit
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
-	"errors"
 
 	"github.com/PlexiOSS/Keel/hotcache"
 )

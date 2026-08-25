@@ -222,6 +222,7 @@ func respond(ctx context.Context, w http.ResponseWriter, data chan HttpResponse)
 		if !ok {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(State.Constants.InternalServerError))
+			return
 		}
 
 		if msg.Redirect != "" {
@@ -243,7 +244,7 @@ func respond(ctx context.Context, w http.ResponseWriter, data chan HttpResponse)
 			bytes, err := jsonimpl.Marshal(msg.Json)
 
 			if err != nil {
-				State.Logger.Error("[uapi.respond] Failed to unmarshal JSON response", zap.Error(err), zap.Int("size", len(msg.Data)))
+				State.Logger.Error("[uapi.respond] Failed to marshal JSON response", zap.Error(err), zap.Int("size", len(msg.Data)))
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(State.Constants.InternalServerError))
 				return

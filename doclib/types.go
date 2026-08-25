@@ -44,7 +44,7 @@ type Security struct {
 	Type        string `json:"type"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	In          string `json:"in"` // must be apiKey for Popplio
+	In          string `json:"in"`
 }
 
 type Component struct {
