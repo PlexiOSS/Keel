@@ -70,62 +70,12 @@ func TableName(platform Platform) string {
 func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.PlatformUser, error) {
 	state := platform.GetState()
 
-	if !platform.Initted() {
-		err := InitPlatform(platform)
-
-		if err != nil {
-			return nil, errors.New("failed to init platform: " + err.Error())
-		}
-
-		if !platform.Initted() {
-			return nil, errors.New("platform init() did not set initted() to true")
-		}
+	if err := ensureInit(platform); err != nil {
+		return nil, err
 	}
 
 	var platformName = platform.PlatformName()
 	var tableName = TableName(platform)
-
-	applyMiddlewares := func(u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
-		if u.DisplayName == "" {
-			u.DisplayName = u.Username
-		}
-
-		var err error
-
-		for i, middleware := range state.Middlewares {
-			u, err = middleware(platform, u)
-
-			if err != nil {
-				return nil, fmt.Errorf("middleware %d failed: %s", i, err)
-			}
-		}
-
-		return u, nil
-	}
-
-	persistFresh := func(u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
-		if u == nil {
-			return nil, errors.New("user not found")
-		}
-
-		u, err := applyMiddlewares(u)
-
-		if err != nil {
-			return nil, err
-		}
-
-		_, err = state.Pool.Exec(state.Context, "INSERT INTO "+tableName+" (id, username, display_name, avatar, bot) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET username = $2, display_name = $3, avatar = $4, bot = $5, last_updated = NOW()", u.ID, u.Username, u.DisplayName, u.Avatar, u.Bot)
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to update internal user cache: %s", err)
-		}
-
-		if err := state.PlatformUserCache.Set(state.Context, platformName+":"+id, u, state.UserExpiryTime); err != nil {
-			state.Logger.Warn("Failed to set user in hot cache", zap.Error(err), zap.String("id", id), zap.String("platform", platformName))
-		}
-
-		return u, nil
-	}
 
 	uCached, err := platform.PlatformSpecificCache(ctx, id)
 
@@ -134,7 +84,7 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 	}
 
 	if uCached != nil {
-		return persistFresh(uCached)
+		return persistFresh(platform, uCached)
 	}
 
 	user, err := state.PlatformUserCache.Get(ctx, platformName+":"+id)
@@ -190,7 +140,7 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 		hotCacheTTL := state.UserExpiryTime - age
 
 		if hotCacheTTL <= 0 {
-			refreshInBackground(platform, id, persistFresh)
+			refreshInBackground(platform, id)
 
 			hotCacheTTL = state.StaleRetryTime
 
@@ -199,7 +149,7 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 			}
 		}
 
-		row, err = applyMiddlewares(row)
+		row, err = applyMiddlewares(platform, row)
 
 		if err != nil {
 			return nil, err
@@ -218,10 +168,101 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 		return nil, errors.New("failed to get user from platform: " + err.Error())
 	}
 
-	return persistFresh(user)
+	return persistFresh(platform, user)
 }
 
-func refreshInBackground(platform Platform, id string, persist func(*dovetypes.PlatformUser) (*dovetypes.PlatformUser, error)) {
+func ensureInit(platform Platform) error {
+	if platform.Initted() {
+		return nil
+	}
+
+	if err := InitPlatform(platform); err != nil {
+		return errors.New("failed to init platform: " + err.Error())
+	}
+
+	if !platform.Initted() {
+		return errors.New("platform init() did not set initted() to true")
+	}
+
+	return nil
+}
+
+func applyMiddlewares(platform Platform, u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
+	if u.DisplayName == "" {
+		u.DisplayName = u.Username
+	}
+
+	var err error
+
+	for i, middleware := range platform.GetState().Middlewares {
+		u, err = middleware(platform, u)
+
+		if err != nil {
+			return nil, fmt.Errorf("middleware %d failed: %s", i, err)
+		}
+	}
+
+	return u, nil
+}
+
+func persistFresh(platform Platform, u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
+	if u == nil {
+		return nil, errors.New("user not found")
+	}
+
+	state := platform.GetState()
+	platformName := platform.PlatformName()
+
+	u, err := applyMiddlewares(platform, u)
+
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = state.Pool.Exec(state.Context, "INSERT INTO "+TableName(platform)+" (id, username, display_name, avatar, bot) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET username = $2, display_name = $3, avatar = $4, bot = $5, last_updated = NOW()", u.ID, u.Username, u.DisplayName, u.Avatar, u.Bot)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to update internal user cache: %s", err)
+	}
+
+	if err := state.PlatformUserCache.Set(state.Context, platformName+":"+u.ID, u, state.UserExpiryTime); err != nil {
+		state.Logger.Warn("Failed to set user in hot cache", zap.Error(err), zap.String("id", u.ID), zap.String("platform", platformName))
+	}
+
+	return u, nil
+}
+
+func RefreshUser(ctx context.Context, id string, platform Platform) (*dovetypes.PlatformUser, error) {
+	if err := ensureInit(platform); err != nil {
+		return nil, err
+	}
+
+	key := platform.PlatformName() + ":" + id
+
+	if _, alreadyRunning := refreshesInFlight.LoadOrStore(key, struct{}{}); alreadyRunning {
+		return nil, nil
+	}
+
+	defer refreshesInFlight.Delete(key)
+
+	user, err := platform.PlatformSpecificCache(ctx, id)
+
+	if err != nil {
+		return nil, fmt.Errorf("platformSpecificCache failed: %s", err)
+	}
+
+	if user == nil {
+		user, err = platform.GetUser(ctx, id)
+
+		if err != nil {
+			return nil, errors.New("failed to get user from platform: " + err.Error())
+		}
+	}
+
+	return persistFresh(platform, user)
+}
+
+func refreshInBackground(platform Platform, id string) {
 	state := platform.GetState()
 	platformName := platform.PlatformName()
 	key := platformName + ":" + id
@@ -245,7 +286,7 @@ func refreshInBackground(platform Platform, id string, persist func(*dovetypes.P
 			return
 		}
 
-		if _, err := persist(&dovetypes.PlatformUser{
+		if _, err := persistFresh(platform, &dovetypes.PlatformUser{
 			ID:          id,
 			Username:    user.Username,
 			Avatar:      user.Avatar,
@@ -277,16 +318,8 @@ type ClearUserReq struct {
 func ClearUser(ctx context.Context, id string, platform Platform, req ClearUserReq) (*ClearUserInfo, error) {
 	state := platform.GetState()
 
-	if !platform.Initted() {
-		err := InitPlatform(platform)
-
-		if err != nil {
-			return nil, errors.New("failed to init platform: " + err.Error())
-		}
-
-		if !platform.Initted() {
-			return nil, errors.New("platform init() did not set initted() to true")
-		}
+	if err := ensureInit(platform); err != nil {
+		return nil, err
 	}
 
 	var platformName = platform.PlatformName()
