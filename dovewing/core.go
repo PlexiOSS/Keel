@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/PlexiOSS/Keel/dovewing/dovetypes"
@@ -21,7 +22,12 @@ type BaseState struct {
 	PlatformUserCache hotcache.HotCache[dovetypes.PlatformUser]
 	Middlewares       []func(p Platform, u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error)
 	UserExpiryTime    time.Duration
+	StaleRetryTime    time.Duration
 }
+
+const defaultStaleRetryTime = time.Minute
+
+var refreshesInFlight sync.Map
 
 type Platform interface {
 	Init() error
@@ -61,12 +67,10 @@ func TableName(platform Platform) string {
 	return "internal_user_cache__" + platform.PlatformName()
 }
 
-// Fetches a user based on the platform
 func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.PlatformUser, error) {
 	state := platform.GetState()
 
 	if !platform.Initted() {
-		// call InitPlatform first
 		err := InitPlatform(platform)
 
 		if err != nil {
@@ -81,12 +85,7 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 	var platformName = platform.PlatformName()
 	var tableName = TableName(platform)
 
-	// Common cacher, applicable to all use cases
-	cachedReturn := func(u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
-		if u == nil {
-			return nil, errors.New("user not found")
-		}
-
+	applyMiddlewares := func(u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
 		if u.DisplayName == "" {
 			u.DisplayName = u.Username
 		}
@@ -101,19 +100,33 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 			}
 		}
 
-		// Update cache
+		return u, nil
+	}
+
+	persistFresh := func(u *dovetypes.PlatformUser) (*dovetypes.PlatformUser, error) {
+		if u == nil {
+			return nil, errors.New("user not found")
+		}
+
+		u, err := applyMiddlewares(u)
+
+		if err != nil {
+			return nil, err
+		}
+
 		_, err = state.Pool.Exec(state.Context, "INSERT INTO "+tableName+" (id, username, display_name, avatar, bot) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET username = $2, display_name = $3, avatar = $4, bot = $5, last_updated = NOW()", u.ID, u.Username, u.DisplayName, u.Avatar, u.Bot)
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to update internal user cache: %s", err)
 		}
 
-		state.PlatformUserCache.Set(state.Context, platformName+":"+id, u, state.UserExpiryTime)
+		if err := state.PlatformUserCache.Set(state.Context, platformName+":"+id, u, state.UserExpiryTime); err != nil {
+			state.Logger.Warn("Failed to set user in hot cache", zap.Error(err), zap.String("id", id), zap.String("platform", platformName))
+		}
 
 		return u, nil
 	}
 
-	// First, check platform specific cache
 	uCached, err := platform.PlatformSpecificCache(ctx, id)
 
 	if err != nil {
@@ -121,10 +134,9 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 	}
 
 	if uCached != nil {
-		return cachedReturn(uCached)
+		return persistFresh(uCached)
 	}
 
-	// Check if in redis cache
 	user, err := state.PlatformUserCache.Get(ctx, platformName+":"+id)
 
 	if err != nil && err != hotcache.ErrHotCacheDataNotFound {
@@ -147,65 +159,22 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 		return user, nil
 	}
 
-	// Check if in internal user cache, this allows fetches of users not in cache to be done in the background
-	var count int64
+	var (
+		username    string
+		displayName string
+		avatar      string
+		bot         bool
+		lastUpdated time.Time
+	)
 
-	err = state.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM "+tableName+" WHERE id = $1", id).Scan(&count)
+	err = state.Pool.QueryRow(ctx, "SELECT username, display_name, avatar, bot, last_updated FROM "+tableName+" WHERE id = $1", id).Scan(&username, &displayName, &avatar, &bot, &lastUpdated)
 
-	if errors.Is(err, pgx.ErrNoRows) {
-		count = 0
-	} else if err != nil {
-		// If theres a error here, then warn and continue. We never want to fail a fetch because of a internal cache table being remade
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		state.Logger.Warn("Failed to check internal user cache.", zap.Error(err), zap.String("id", id), zap.String("platform", platformName), zap.String("tableName", tableName))
 	}
 
-	if err == nil && count > 0 {
-		// Check if expired
-		var lastUpdated time.Time
-
-		err = state.Pool.QueryRow(ctx, "SELECT last_updated FROM "+tableName+" WHERE id = $1", id).Scan(&lastUpdated)
-
-		if err != nil {
-			return nil, err
-		}
-
-		if time.Since(lastUpdated) > state.UserExpiryTime {
-			// Update in background, since this is in cache, users won't mind this but will mind timeouts
-			go func() {
-				// Get from platform
-				state.Logger.Info("Updating expired user cache", zap.String("id", id), zap.String("platform", platformName))
-
-				user, err := platform.GetUser(ctx, id)
-
-				if err != nil {
-					state.Logger.Error("Failed to update expired user cache", zap.Error(err))
-					return
-				}
-
-				cachedReturn(&dovetypes.PlatformUser{
-					ID:          id,
-					Username:    user.Username,
-					Avatar:      user.Avatar,
-					DisplayName: user.DisplayName,
-					Bot:         user.Bot,
-					Status:      user.Status,
-				})
-			}()
-		}
-
-		var username string
-		var avatar string
-		var bot bool
-		var createdAt time.Time
-		var displayName string
-
-		err = state.Pool.QueryRow(ctx, "SELECT username, display_name, avatar, bot, created_at FROM "+tableName+" WHERE id = $1", id).Scan(&username, &displayName, &avatar, &bot, &createdAt)
-
-		if err != nil {
-			return nil, err
-		}
-
-		return cachedReturn(&dovetypes.PlatformUser{
+	if err == nil {
+		row := &dovetypes.PlatformUser{
 			ID:          id,
 			Username:    username,
 			Avatar:      avatar,
@@ -215,17 +184,78 @@ func GetUser(ctx context.Context, id string, platform Platform) (*dovetypes.Plat
 			ExtraData: map[string]any{
 				"cache": "pg",
 			},
-		})
+		}
+
+		age := time.Since(lastUpdated)
+		hotCacheTTL := state.UserExpiryTime - age
+
+		if hotCacheTTL <= 0 {
+			refreshInBackground(platform, id, persistFresh)
+
+			hotCacheTTL = state.StaleRetryTime
+
+			if hotCacheTTL <= 0 {
+				hotCacheTTL = defaultStaleRetryTime
+			}
+		}
+
+		row, err = applyMiddlewares(row)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if err := state.PlatformUserCache.Set(state.Context, platformName+":"+id, row, hotCacheTTL); err != nil {
+			state.Logger.Warn("Failed to set user in hot cache", zap.Error(err), zap.String("id", id), zap.String("platform", platformName))
+		}
+
+		return row, nil
 	}
 
-	// Get from platform
 	user, err = platform.GetUser(ctx, id)
 
 	if err != nil {
 		return nil, errors.New("failed to get user from platform: " + err.Error())
 	}
 
-	return cachedReturn(user)
+	return persistFresh(user)
+}
+
+func refreshInBackground(platform Platform, id string, persist func(*dovetypes.PlatformUser) (*dovetypes.PlatformUser, error)) {
+	state := platform.GetState()
+	platformName := platform.PlatformName()
+	key := platformName + ":" + id
+
+	if _, alreadyRunning := refreshesInFlight.LoadOrStore(key, struct{}{}); alreadyRunning {
+		return
+	}
+
+	go func() {
+		defer refreshesInFlight.Delete(key)
+
+		ctx, cancel := context.WithTimeout(state.Context, 30*time.Second)
+		defer cancel()
+
+		state.Logger.Info("Updating expired user cache", zap.String("id", id), zap.String("platform", platformName))
+
+		user, err := platform.GetUser(ctx, id)
+
+		if err != nil {
+			state.Logger.Error("Failed to update expired user cache; will retry on a later lookup", zap.Error(err), zap.String("id", id), zap.String("platform", platformName))
+			return
+		}
+
+		if _, err := persist(&dovetypes.PlatformUser{
+			ID:          id,
+			Username:    user.Username,
+			Avatar:      user.Avatar,
+			DisplayName: user.DisplayName,
+			Bot:         user.Bot,
+			Status:      user.Status,
+		}); err != nil {
+			state.Logger.Error("Failed to persist refreshed user", zap.Error(err), zap.String("id", id), zap.String("platform", platformName))
+		}
+	}()
 }
 
 type ClearFrom string
@@ -235,33 +265,19 @@ const (
 	ClearFromRedis             ClearFrom = "redis"
 )
 
-// ClearUserInfo contains information on a clear operation
 type ClearUserInfo struct {
-	// The user that was cleared
 	ClearedFrom []ClearFrom
-
-	// Whether the user was a bot or not
-	IsBot bool
+	IsBot       bool
 }
 
 type ClearUserReq struct {
-	// Where to clear from
-	//
-	// iuc -> internal user cache (postgres)
-	//
-	// Redis -> redis cache
-	//
-	//
-	// If not specified, will clear from all
 	ClearFrom []ClearFrom
 }
 
-// Clears a user of a platform
 func ClearUser(ctx context.Context, id string, platform Platform, req ClearUserReq) (*ClearUserInfo, error) {
 	state := platform.GetState()
 
 	if !platform.Initted() {
-		// call InitPlatform first
 		err := InitPlatform(platform)
 
 		if err != nil {
@@ -285,7 +301,6 @@ func ClearUser(ctx context.Context, id string, platform Platform, req ClearUserR
 		return nil, err
 	}
 
-	// Check iuc
 	if len(req.ClearFrom) == 0 || slices.Contains(req.ClearFrom, ClearFromInternalUserCache) {
 		var count int64
 
@@ -296,7 +311,6 @@ func ClearUser(ctx context.Context, id string, platform Platform, req ClearUserR
 		}
 
 		if count > 0 {
-			// Delete from iuc
 			_, err = state.Pool.Exec(ctx, "DELETE FROM "+tableName+" WHERE id = $1", id)
 
 			if err != nil {
@@ -307,9 +321,7 @@ func ClearUser(ctx context.Context, id string, platform Platform, req ClearUserR
 		}
 	}
 
-	// Check redis
 	if len(req.ClearFrom) == 0 || slices.Contains(req.ClearFrom, ClearFromRedis) {
-		// Delete from redis
 		err := state.PlatformUserCache.Delete(ctx, platformName+":"+id)
 
 		if err != nil {
