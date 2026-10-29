@@ -1,33 +1,43 @@
 package crypto
 
 import (
-	"math/rand"
-	"time"
-	"unsafe"
+	"crypto/rand"
 )
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-const (
-	letterIdxBits = 6
-	letterIdxMask = 1<<letterIdxBits - 1
-	letterIdxMax  = 63 / letterIdxBits
-)
+const letterIdxMask = 1<<6 - 1
+
+func fill(b []byte) {
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto: failed to read random bytes: " + err.Error())
+	}
+}
 
 func RandString(n int) string {
-	var src = rand.NewSource(time.Now().UnixNano())
-
-	b := make([]byte, n)
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
+	if n <= 0 {
+		return ""
 	}
 
-	return *(*string)(unsafe.Pointer(&b))
+	b := make([]byte, n)
+	buf := make([]byte, n+n/4+16)
+	fill(buf)
+
+	for i, read := 0, 0; i < n; {
+		if read == len(buf) {
+			fill(buf)
+			read = 0
+		}
+
+		idx := int(buf[read] & letterIdxMask)
+		read++
+
+		if idx >= len(letterBytes) {
+			continue
+		}
+
+		b[i] = letterBytes[idx]
+		i++
+	}
+
+	return string(b)
 }
